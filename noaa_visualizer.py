@@ -244,4 +244,4 @@ def main():
     print("Betik Tamamlandı.")
 
 # Ana fonksiyonu direkt çağırıyoruz (Colab için en kolayı)
-main()     bunu nasıl eklicez oraya bunu collab ortamında yaptık dosya olarak nasıl indiricez
+main()
