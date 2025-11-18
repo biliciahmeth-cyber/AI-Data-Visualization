@@ -2,7 +2,7 @@
 
 This project is an automated Python pipeline that fetches, processes, and visualizes AI-generated weather forecast data from NOAA's public S3 buckets. It is designed to run efficiently on a resource-constrained server, automating the entire data-to-image workflow.
 
-## 🚀 Key Features
+## Key Features
 
 * **Automated Data Fetching:** The script automatically calculates the latest 00Z model run time and downloads the correct 5GB global dataset (NVIDIA's FourCastNet `FOUR_v200_GFS`) using `requests`.
 * **Multi-Parameter Plotting:** Generates 9 distinct meteorological maps, including 2m Temperature, 10m Wind Speed, MSL Pressure, Precipitable Water, and 500hPa Geopotential Height.
@@ -11,7 +11,7 @@ This project is an automated Python pipeline that fetches, processes, and visual
 * **Self-Cleaning:** Automatically deletes the 5GB source NetCDF file after processing is complete, ensuring the server's disk space is preserved.
 * **Technology Stack:** `Python`, `xarray` (for data processing), `cartopy` (for map projections), `matplotlib` (for plotting), `numpy` (for calculations), and `requests` (for downloading).
 
-## 🗺️ Technical Pipeline
+## Technical Pipeline
 
 The script executes the following workflow:
 
@@ -21,7 +21,7 @@ The script executes the following workflow:
 4.  **Visualize:** Uses `cartopy` to project the data onto a Mercator map, applying the correct adaptive color scale for each domain.
 5.  **Save & Clean Up:** Saves the final maps as `.png` files and immediately deletes the 5GB source file.
 
-## 📊 Visualized Parameters
+## Visualized Parameters
 
 1.  **2m Temperature** (with adaptive 0.5°C scaling)
 2.  **10m Wind Speed**
@@ -33,7 +33,7 @@ The script executes the following workflow:
 8.  **Skin Temperature**
 9.  **500 hPa Geopotential Height & Temperature**
 
-## ⚙️ Setup and Automation
+## Setup and Automation
 
 1.  **Install Dependencies:**
     ```bash
