@@ -1,7 +1,14 @@
-# --- ADIM 1: Gerekli Kütüphaneler ---
-print("Kütüphaneler kontrol ediliyor...")
-!pip install xarray netCDF4 cartopy matplotlib numpy
-print("Hazır.")
+#!/usr/bin/env python3
+# -- coding: utf-8 --
+
+"""
+NOAA AI Model - TURBO EDITION (Multiprocessing)
+Bu versiyon, haritaları paralel (aynı anda) çizerek işlem süresini kısaltır.
+Yerel bilgisayar ve Sunucu uyumludur.
+"""
+
+# --- Gerekli Kütüphaneler ---
+# Kurulum: pip install xarray netCDF4 cartopy matplotlib numpy requests pandas
 
 import xarray as xr
 import matplotlib.pyplot as plt
@@ -11,237 +18,256 @@ import os
 import warnings
 from datetime import datetime, timedelta, time
 import numpy as np
+import requests
+import shutil
+import pandas as pd
+from multiprocessing import Pool, cpu_count # <-- Hızın sırrı burada
 
-# --- 2. GLOBAL AYARLAR ---
+# --- 1. GLOBAL AYARLAR ---
 
-KAYIT_KLASORU = '.'
+# Çıktıların kaydedileceği yer.
+KAYIT_KLASORU = '.' 
 
-# ZAMAN ADIMLARI (Analiz, Yarın, Ertesi Gün)
+# AYNI ANDA KAÇ HARİTA ÇİZİLSİN?
+# Bilgisayarın iyiyse (8+ çekirdek) burayı 6-8 yapabilirsin.
+# Sunucu veya orta halli laptop için 4 idealdir.
+ISCI_SAYISI = 4
+
+# ZAMAN ADIMLARI
+# 0=Analiz, 4=+24h, 8=+48h
 TAHMIN_ADIMLARI = {
-    0: "000h",
-    4: "024h",
-    8: "048h"
+    0: "f000",
+    4: "f024",
+    8: "f048"
 }
 
-# BÖLGELER VE KOORDİNATLAR
+# BÖLGELER
 DOMAINS = {
-    "GFS":      [-20, 60, 25, 65],   # Avrupa Geneli
-    "Domain1":  [25, 45, 34, 43],    # Türkiye
-    "Domain2":  [26, 32, 39, 42.5]   # Marmara
+    "europe":   [-20, 60, 25, 65],
+    "turkey":   [25, 45, 34, 43],
+    "marmara":  [26, 32, 39, 42.5]
 }
+
+# MODELLER
+MODELLER = [
+    "FOUR_v200_GFS",  # Nvidia
+    "GRAP_v100_GFS",  # Google
+    "PANG_v100_GFS",  # Huawei
+    "AURO_v100_GFS"   # Microsoft
+]
 
 warnings.filterwarnings('ignore')
 
-# --- 3. HARİTA ÇİZDİRME MOTORU ---
+# --- 2. YARDIMCI FONKSİYONLAR ---
 
-def harita_cizdir(
-    data_array_doldurma, model_basligi, parametre_adi_baslik,
-    tahmin_zamani_str, tahmin_saati_h_str, kaydedilecek_dosya_adi,
-    renk_cubugu_etiketi, renk_skalasi, renk_seviyeleri,
-    harita_sinirlari, 
-    data_array_cizgiler=None, cizgi_seviyeleri=None,
-    cizgi_renkleri='black', cizgi_etiketleri_goster=False
-    ):
+def python_ile_indir(url, hedef_yol):
+    """Dosyayı indirir."""
+    print(f"   >> İndiriliyor: {url}")
     try:
-        print(f"---> {kaydedilecek_dosya_adi}")
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        with requests.get(url, stream=True, headers=headers, timeout=120) as r:
+            r.raise_for_status()
+            with open(hedef_yol, 'wb') as f:
+                shutil.copyfileobj(r.raw, f)
+        print("   >> İndirme Tamamlandı.")
+        return True
+    except Exception as e:
+        print(f"   >> İndirme HATASI: {e}")
+        return False
+
+# --- PARALEL ÇALIŞACAK FONKSİYON (İŞÇİ) ---
+# Bu fonksiyon ana programdan bağımsız çalışır.
+def plot_wrapper(args):
+    """
+    Tek bir haritayı çizen fonksiyon.
+    Multiprocessing havuzuna bu fonksiyon gönderilir.
+    """
+    # Argüman paketini aç
+    (data_slice, title_main, title_sub, time_str, fcst_h, filename, label, cmap, levels, extent, c_data_slice, c_levels) = args
+    
+    try:
+        # Matplotlib backend ayarı (Hata almamak için)
+        plt.switch_backend('Agg') 
+        
         fig = plt.figure(figsize=(12, 10))
         ax = plt.axes(projection=ccrs.Mercator())
-        
-        # Domain sınırlarını ayarla
-        ax.set_extent(harita_sinirlari, crs=ccrs.PlateCarree())
+        ax.set_extent(extent, crs=ccrs.PlateCarree())
 
-        # 1. Dolgu (extend='both' taşan değerleri de boyar)
-        kontur_dolgu = data_array_doldurma.plot.contourf(
-            ax=ax, transform=ccrs.PlateCarree(), levels=renk_seviyeleri,
-            cmap=renk_skalasi, add_colorbar=False, extend='both'
+        # 1. Dolgu
+        fill = data_slice.plot.contourf(
+            ax=ax, transform=ccrs.PlateCarree(), levels=levels, cmap=cmap, add_colorbar=False, extend='both'
         )
-        cbar = plt.colorbar(kontur_dolgu, ax=ax, orientation='vertical', pad=0.02, shrink=0.8)
-        cbar.set_label(renk_cubugu_etiketi)
+        cbar = plt.colorbar(fill, ax=ax, orientation='vertical', pad=0.02, shrink=0.8)
+        cbar.set_label(label)
 
-        # 2. Çizgi (Opsiyonel)
-        if data_array_cizgiler is not None:
-            kontur_cizgi = data_array_cizgiler.plot.contour(
-                ax=ax, transform=ccrs.PlateCarree(), levels=cizgi_seviyeleri,
-                colors=cizgi_renkleri, linewidths=0.8
+        # 2. Çizgi (Varsa)
+        if c_data_slice is not None:
+            lines = c_data_slice.plot.contour(
+                ax=ax, transform=ccrs.PlateCarree(), levels=c_levels, colors='black', linewidths=0.8
             )
-            if cizgi_etiketleri_goster:
-                ax.clabel(kontur_cizgi, inline=True, fontsize=8, fmt='%i')
+            ax.clabel(lines, inline=True, fontsize=8, fmt='%i')
 
-        # Harita Süslemeleri
-        ax.add_feature(cfeature.COASTLINE)
-        ax.add_feature(cfeature.BORDERS, linestyle=':')
-        ax.gridlines(draw_labels=True, dms=True, x_inline=False, y_inline=False)
+        # Süslemeler
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
+        ax.add_feature(cfeature.BORDERS, linestyle=':', linewidth=0.6)
 
-        plt.title(f"{model_basligi}\n{parametre_adi_baslik} ({tahmin_saati_h_str})", fontsize=12)
+        plt.title(f"{title_main}\n{title_sub} ({fcst_h}) - Geçerlilik: {time_str} (Yerel)", fontsize=10)
 
-        tam_kayit_yolu = os.path.join(KAYIT_KLASORU, kaydedilecek_dosya_adi)
-        plt.savefig(tam_kayit_yolu, dpi=100, bbox_inches='tight')
-        plt.close(fig)
+        save_path = os.path.join(KAYIT_KLASORU, filename)
+        plt.savefig(save_path, dpi=90, bbox_inches='tight')
+        plt.close(fig) # Hafızayı temizle
+        
+        # Başarılı olursa dosya adını dön (Log için)
+        return f"OK: {filename}"
         
     except Exception as e:
-        print(f"     HATA ({kaydedilecek_dosya_adi}): {e}")
+        return f"HATA: {filename} - {e}"
 
-# --- 4. ANA PROGRAM ---
+# --- 3. ANA PROGRAM ---
 
 def main():
-    print("======================================================")
-    print(f"NOAA AI Harita Betiği (Final Düzeltilmiş) - {datetime.now()}")
-    print("======================================================")
+    baslangic_zamani = datetime.now()
+    print(f"\n=== AI WEATHER PIPELINE (TURBO MOD) BAŞLATILDI: {baslangic_zamani} ===\n")
+    print(f"   >> Paralel İşlemci Sayısı: {ISCI_SAYISI}")
 
-    # --- ADIM A: TARİH HESAPLAMA ---
-    utc_simdi = datetime.utcnow()
-    if utc_simdi.time() < time(6, 0): 
-        model_tarihi = utc_simdi.date() - timedelta(days=1)
-    else:
-        model_tarihi = utc_simdi.date()
+    # Tarih Hesapla
+    utc_now = datetime.utcnow()
+    model_date = utc_now.date() - timedelta(days=1) if utc_now.time() < time(6, 0) else utc_now.date()
+    
+    yyyy = model_date.strftime('%Y')
+    mmdd = model_date.strftime('%m%d')
+    full_date = model_date.strftime('%Y%m%d')
+    
+    print(f"Hedef Tarih (00Z): {full_date}")
 
-    yil_str = model_tarihi.strftime('%Y')
-    ay_gun_str = model_tarihi.strftime('%m%d')
-    tam_tarih_str = model_tarihi.strftime('%Y%m%d')
+    # --- MODEL DÖNGÜSÜ ---
+    for model_name in MODELLER:
+        print(f"\n--------------------------------------------------")
+        print(f"İŞLENEN MODEL: {model_name}")
+        print(f"--------------------------------------------------")
 
-    dosya_adi = f"FOUR_v200_GFS_{tam_tarih_str}00_f000_f240_06.nc"
-    dosya_linki = f"https://noaa-oar-mlwp-data.s3.amazonaws.com/FOUR_v200_GFS/{yil_str}/{ay_gun_str}/{dosya_adi}"
-    indirilen_dosya_yolu = os.path.join(KAYIT_KLASORU, dosya_adi)
+        nc_filename = f"{model_name}_{full_date}00_f000_f240_06.nc"
+        url = f"https://noaa-oar-mlwp-data.s3.amazonaws.com/{model_name}/{yyyy}/{mmdd}/{nc_filename}"
+        local_path = os.path.join(KAYIT_KLASORU, nc_filename)
 
-    # --- ADIM B: İNDİRME ---
-    if not os.path.exists(indirilen_dosya_yolu):
-        print(f"İndiriliyor (4.3GB): {dosya_linki}")
-        os.system(f"wget -O {indirilen_dosya_yolu} {dosya_linki}")
-    else:
-        print("Dosya zaten mevcut, indirme atlanıyor.")
+        # 1. İNDİR
+        if not os.path.exists(local_path):
+            if not python_ile_indir(url, local_path):
+                print(f"!!! {model_name} İNDİRİLEMEDİ, ATLANİYOR !!!")
+                continue
+        else:
+            print("   >> Dosya zaten var.")
 
-    print("\nVeri işleniyor...")
-    try:
-        ds = xr.open_dataset(indirilen_dosya_yolu)
-        baslik = f"AI Model (FOUR_v200_GFS) - {tam_tarih_str} 00Z"
+        # 2. GÖREVLERİ HAZIRLA (Çizmeden önce listeye atıyoruz)
+        gorev_listesi = [] # Yapılacak işler paketi
+        
+        try:
+            # Dosyayı aç (chunks={} ile RAM'i patlatmadan açar)
+            ds = xr.open_dataset(local_path, chunks={})
+            short_name = model_name.split('_')[0] 
+            main_title = f"{short_name} AI Model - {full_date} 00Z"
 
-        # =====================================================================
-        # GÖREVLER
-        # =====================================================================
+            # Parametre Tanımları (Adı, Başlığı, DosyaEki, Birimi, Renk, İşlem, ÖzelDurum)
+            tasks_config = [
+                ('t2', '2m Temperature', 'temp_2m', '°C', 'Spectral_r', lambda x: x-273.15, None),
+                ('u10', '10m Wind Speed', 'wind_10m', 'm/s', 'YlOrRd', None, 'calc_wind'),
+                ('msl', 'MSLP', 'mslp', 'hPa', 'RdBu_r', lambda x: x/100.0, None),
+                ('tcwv', 'Precipitable Water', 'pr_wtr', 'mm', 'YlGnBu', None, None),
+                ('r', '700 hPa Humidity', 'rh_700', '%', 'Blues', None, 'sel_700'),
+                ('t', '850 hPa Temp', 'temp_850', '°C', 'coolwarm', lambda x: x-273.15, 'sel_850'),
+                ('skt', 'Skin Temperature', 'skt', '°C', 'inferno', lambda x: x-273.15, None),
+                ('w', '500 hPa Vert. Vel.', 'w_500', 'Pa/s', 'RdBu_r', None, 'sel_500'),
+                ('z', '500 hPa Geopotential', 'hgt_500', 'gpm', 'RdBu_r', None, 'sel_500_combo')
+            ]
 
-        # --- GÖREV 1: 2m SICAKLIK (DİNAMİK SKALA) ---
-        print("\n>>> Görev 1: 2m Sıcaklık (Dinamik Skala)")
-        t2_c = ds['t2'] - 273.15
-        for idx, saat in TAHMIN_ADIMLARI.items():
-            d = t2_c.isel(time=idx)
-            t_str = d.time.dt.strftime('%d-%H:00').item()
+            print("   >> Veriler hazırlanıyor ve belleğe alınıyor...")
+
+            for var_name, title, file_prefix, unit, cmap_def, func, special in tasks_config:
+                
+                # Veri var mı kontrolü
+                if var_name not in ds and special != 'calc_wind': continue
+
+                # --- VERİYİ BELLEĞE ÇEK (.load()) ---
+                # Multiprocessing için verinin diske bağlı kalmaması, RAM'de olması lazım.
+                if special == 'calc_wind':
+                    data = np.sqrt(ds['u10']*2 + ds['v10']*2).load()
+                elif special == 'sel_700': data = ds[var_name].sel(level=700).load()
+                elif special == 'sel_850': data = ds[var_name].sel(level=850).load()
+                elif special == 'sel_500': data = ds[var_name].sel(level=500).load()
+                elif special == 'sel_500_combo':
+                    data = ds['t'].sel(level=500).load()
+                    c_data = ds['z'].sel(level=500).load()
+                else:
+                    data = ds[var_name].load()
+
+                # Birim Dönüşümü
+                if func and special != 'sel_500_combo': data = func(data)
+                if special == 'sel_500_combo':
+                    data = data - 273.15
+                    c_data = c_data / 9.80665
+
+                # Kombinasyonları Listele
+                for idx, step in TAHMIN_ADIMLARI.items():
+                    # Zamanı kes
+                    d_slice = data.isel(time=idx)
+                    # Türkiye Saati Ayarı
+                    zaman_tr = d_slice.time.values + np.timedelta64(3, 'h')
+                    valid_time = pd.to_datetime(zaman_tr).strftime('%d %b %H:00')
+
+                    c_d_slice = None
+                    c_levels = None
+                    if special == 'sel_500_combo':
+                        c_d_slice = c_data.isel(time=idx)
+                        c_levels = np.arange(4800, 6000, 60)
+
+                    for dom, extent in DOMAINS.items():
+                        # Skala Ayarları
+                        levels = None
+                        if file_prefix in ['temp_2m', 'skt']:
+                            if dom == "marmara": levels = np.arange(-5, 35.5, 0.5)
+                            elif dom == "turkey": levels = np.arange(-15, 41, 1)
+                            else: levels = np.arange(-30, 46, 2)
+                        elif file_prefix == 'wind_10m': levels = np.arange(0, 31, 2)
+                        elif file_prefix == 'mslp': levels = np.arange(980, 1045, 4)
+                        elif file_prefix == 'pr_wtr': levels = np.arange(0, 70, 2)
+                        elif file_prefix == 'rh_700': levels = np.arange(0, 101, 5)
+                        elif file_prefix == 'temp_850': levels = np.arange(-25, 26, 2)
+                        elif file_prefix == 'w_500': levels = np.arange(-2, 2.1, 0.2)
+                        elif file_prefix == 'hgt_500': levels = np.arange(-40, 0, 2)
+
+                        fname = f"{file_prefix}{step}{dom}_{short_name}.png"
+                        
+                        # Bu paketi işçiye vereceğiz
+                        gorev_paketi = (
+                            d_slice, main_title, title, valid_time, step, fname, unit, cmap_def, levels, extent, c_d_slice, c_levels
+                        )
+                        gorev_listesi.append(gorev_paketi)
+
+            print(f"   >> Toplam {len(gorev_listesi)} harita için paralel çizim başlıyor...")
             
-            for dom, box in DOMAINS.items():
-                if dom == "Domain2": # MARMARA (Hassas)
-                    skala = np.arange(-5, 35.5, 0.5)
-                elif dom == "Domain1": # TÜRKİYE
-                    skala = np.arange(-15, 41, 1)
-                else: # AVRUPA (GFS)
-                    skala = np.arange(-30, 46, 2)
+            # 3. PARALEL ÇİZİMİ BAŞLAT (Havuz Sistemi)
+            # Bu kısım bilgisayarın çekirdeklerini devreye sokar
+            with Pool(processes=ISCI_SAYISI) as pool:
+                # İşleri dağıt ve sonuçları bekle
+                for sonuc in pool.imap_unordered(plot_wrapper, gorev_listesi):
+                    # Çıktıyı çok kirletmemek için sadece hataları basabiliriz
+                    if "HATA" in sonuc:
+                        print(f"      !!! {sonuc}")
+            
+            print("   >> Çizimler tamamlandı.")
 
-                harita_cizdir(d, baslik, f"2m Sıcaklık ({dom})", t_str, f"+{idx*6}h",
-                              f"temp2m_{saat}_{dom}.png", "°C", 'jet', skala, box)
+        except Exception as e:
+            print(f"   !!! İŞLEME HATASI ({model_name}): {e}")
 
-        # --- GÖREV 2: SU BUHARI (TCWV) ---
-        print("\n>>> Görev 2: Precipitable Water")
-        tcwv = ds['tcwv']
-        for idx, saat in TAHMIN_ADIMLARI.items():
-            d = tcwv.isel(time=idx)
-            t_str = d.time.dt.strftime('%d-%H:00').item()
-            for dom, box in DOMAINS.items():
-                harita_cizdir(d, baslik, f"Precipitable Water ({dom})", t_str, f"+{idx*6}h",
-                              f"pwat_{saat}_{dom}.png", "mm", 'nipy_spectral_r', np.arange(0, 70, 2), box)
+        finally:
+            # 4. TEMİZLİK
+            if 'ds' in locals() and ds: ds.close()
+            if os.path.exists(local_path):
+                os.remove(local_path)
+                print(f"   >> Temizlik: {nc_filename} silindi.")
 
-        # --- GÖREV 3: 700 hPa NEM ---
-        print("\n>>> Görev 3: 700 hPa Nem")
-        try:
-            var = ds['r'].sel(level=700)
-            for idx, saat in TAHMIN_ADIMLARI.items():
-                d = var.isel(time=idx)
-                t_str = d.time.dt.strftime('%d-%H:00').item()
-                for dom, box in DOMAINS.items():
-                    harita_cizdir(d, baslik, f"700 hPa Nem ({dom})", t_str, f"+{idx*6}h",
-                                  f"rh700_{saat}_{dom}.png", "%", 'Blues', np.arange(0, 101, 5), box)
-        except: pass
+    print("\n=== TÜM MODELLER BİTTİ ===")
+    print(f"Toplam Süre: {datetime.now() - baslangic_zamani}")
 
-        # --- GÖREV 4: 850 hPa SICAKLIK ---
-        print("\n>>> Görev 4: 850 hPa Sıcaklık")
-        try:
-            var = ds['t'].sel(level=850) - 273.15
-            for idx, saat in TAHMIN_ADIMLARI.items():
-                d = var.isel(time=idx)
-                t_str = d.time.dt.strftime('%d-%H:00').item()
-                for dom, box in DOMAINS.items():
-                    harita_cizdir(d, baslik, f"850 hPa Sıcaklık ({dom})", t_str, f"+{idx*6}h",
-                                  f"temp850_{saat}_{dom}.png", "°C", 'coolwarm', np.arange(-25, 26, 2), box)
-        except: pass
-
-        # --- GÖREV 5: BASINÇ (MSL) ---
-        print("\n>>> Görev 5: Basınç")
-        msl_hpa = ds['msl'] / 100.0
-        for idx, saat in TAHMIN_ADIMLARI.items():
-            d = msl_hpa.isel(time=idx)
-            t_str = d.time.dt.strftime('%d-%H:00').item()
-            for dom, box in DOMAINS.items():
-                harita_cizdir(d, baslik, f"Basınç ({dom})", t_str, f"+{idx*6}h",
-                              f"basinc_{saat}_{dom}.png", "hPa", 'coolwarm_r', np.arange(980, 1045, 4), box)
-
-        # --- GÖREV 6: YER SICAKLIĞI (SKIN TEMP) ---
-        print("\n>>> Görev 6: Skin Temp")
-        try:
-            if 'skt' in ds:
-                var = ds['skt'] - 273.15
-                for idx, saat in TAHMIN_ADIMLARI.items():
-                    d = var.isel(time=idx)
-                    t_str = d.time.dt.strftime('%d-%H:00').item()
-                    for dom, box in DOMAINS.items():
-                        harita_cizdir(d, baslik, f"Yer Sıcaklığı ({dom})", t_str, f"+{idx*6}h",
-                                      f"skt_{saat}_{dom}.png", "°C", 'inferno', np.arange(-20, 45, 2), box)
-        except: pass
-
-        # --- GÖREV 7: DÜŞEY HIZ (500hPa) ---
-        print("\n>>> Görev 7: Düşey Hız")
-        try:
-            if 'w' in ds:
-                var = ds['w'].sel(level=500)
-                for idx, saat in TAHMIN_ADIMLARI.items():
-                    d = var.isel(time=idx)
-                    t_str = d.time.dt.strftime('%d-%H:00').item()
-                    for dom, box in DOMAINS.items():
-                        harita_cizdir(d, baslik, f"500 hPa Düşey Hız ({dom})", t_str, f"+{idx*6}h",
-                                      f"vertvel500_{saat}_{dom}.png", "Pa/s", 'RdBu_r', np.arange(-2, 2.1, 0.2), box)
-        except: pass
-
-        # --- GÖREV 8: RÜZGAR (10m) ---
-        print("\n>>> Görev 8: Rüzgar Hızı")
-        ws = np.sqrt(ds['u10']*2 + ds['v10']*2)
-        for idx, saat in TAHMIN_ADIMLARI.items():
-            d = ws.isel(time=idx)
-            t_str = d.time.dt.strftime('%d-%H:00').item()
-            for dom, box in DOMAINS.items():
-                harita_cizdir(d, baslik, f"10m Rüzgar ({dom})", t_str, f"+{idx*6}h",
-                              f"wind10_{saat}_{dom}.png", "m/s", 'viridis', np.arange(0, 31, 2), box)
-
-        # --- GÖREV 9: 500 hPa Z & T ---
-        print("\n>>> Görev 9: 500 hPa Analizi")
-        z500 = ds['z'].sel(level=500) / 9.80665
-        t500 = ds['t'].sel(level=500) - 273.15
-        for idx, saat in TAHMIN_ADIMLARI.items():
-            dt = t500.isel(time=idx)
-            dz = z500.isel(time=idx)
-            t_str = dt.time.dt.strftime('%d-%H:00').item()
-            for dom, box in DOMAINS.items():
-                harita_cizdir(dt, baslik, f"500 hPa Z & T ({dom})", t_str, f"+{idx*6}h",
-                              f"z500_{saat}_{dom}.png", "°C", 'coolwarm', np.arange(-40, 0, 2), box,
-                              dz, np.arange(4800, 6000, 60), 'black', True)
-
-    except Exception as e:
-        print(f"GENEL HATA: {e}")
-
-    finally:
-        # --- TEMİZLİK ---
-        if 'ds' in locals() and ds: ds.close()
-        if os.path.exists(indirilen_dosya_yolu):
-            os.remove(indirilen_dosya_yolu)
-            print("\nTemizlik yapıldı: İndirilen dosya silindi.")
-
-    print("======================================================")
-    print("Betik Tamamlandı.")
-
-# Ana fonksiyonu direkt çağırıyoruz (Colab için en kolayı)
-main()
+if _name_ == "_main_":
+    main()
